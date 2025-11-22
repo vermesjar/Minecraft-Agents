@@ -13,7 +13,7 @@ import java.util.List;
 import java.util.Map;
 
 public class ResponseParser {
-    
+
     public static ParsedResponse parseAIResponse(String response) {
         if (response == null || response.isEmpty()) {
             return null;
@@ -21,16 +21,16 @@ public class ResponseParser {
 
         try {
             String jsonString = extractJSON(response);
-            
+
             JsonObject json = JsonParser.parseString(jsonString).getAsJsonObject();
-            
+
             String reasoning = json.has("reasoning") ? json.get("reasoning").getAsString() : "";
             String plan = json.has("plan") ? json.get("plan").getAsString() : "";
             List<Task> tasks = new ArrayList<>();
-            
+
             if (json.has("tasks") && json.get("tasks").isJsonArray()) {
                 JsonArray tasksArray = json.getAsJsonArray("tasks");
-                
+
                 for (JsonElement taskElement : tasksArray) {
                     if (taskElement.isJsonObject()) {
                         JsonObject taskObj = taskElement.getAsJsonObject();
@@ -41,11 +41,12 @@ public class ResponseParser {
                     }
                 }
             }
-            
-            if (!reasoning.isEmpty()) {            }
-            
+
+            if (!reasoning.isEmpty()) {
+            }
+
             return new ParsedResponse(reasoning, plan, tasks);
-            
+
         } catch (Exception e) {
             SteveMod.LOGGER.error("Failed to parse AI response: {}", response, e);
             return null;
@@ -54,28 +55,28 @@ public class ResponseParser {
 
     private static String extractJSON(String response) {
         String cleaned = response.trim();
-        
+
         if (cleaned.startsWith("```json")) {
             cleaned = cleaned.substring(7);
         } else if (cleaned.startsWith("```")) {
             cleaned = cleaned.substring(3);
         }
-        
+
         if (cleaned.endsWith("```")) {
             cleaned = cleaned.substring(0, cleaned.length() - 3);
         }
-        
+
         cleaned = cleaned.trim();
-        
+
         // Fix common JSON formatting issues
         cleaned = cleaned.replaceAll("\\n\\s*", " ");
-        
+
         // Fix missing commas between array/object elements (common AI mistake)
         cleaned = cleaned.replaceAll("}\\s+\\{", "},{");
         cleaned = cleaned.replaceAll("}\\s+\\[", "},[");
         cleaned = cleaned.replaceAll("]\\s+\\{", "],{");
         cleaned = cleaned.replaceAll("]\\s+\\[", "],[");
-        
+
         return cleaned;
     }
 
@@ -83,16 +84,16 @@ public class ResponseParser {
         if (!taskObj.has("action")) {
             return null;
         }
-        
+
         String action = taskObj.get("action").getAsString();
         Map<String, Object> parameters = new HashMap<>();
-        
+
         if (taskObj.has("parameters") && taskObj.get("parameters").isJsonObject()) {
             JsonObject paramsObj = taskObj.getAsJsonObject("parameters");
-            
+
             for (String key : paramsObj.keySet()) {
                 JsonElement value = paramsObj.get(key);
-                
+
                 if (value.isJsonPrimitive()) {
                     if (value.getAsJsonPrimitive().isNumber()) {
                         parameters.put(key, value.getAsNumber());
@@ -110,13 +111,16 @@ public class ResponseParser {
                             } else {
                                 list.add(element.getAsString());
                             }
+                        } else if (element.isJsonObject()) {
+                            // Handle nested objects (e.g. blocks list)
+                            list.add(parseMap(element.getAsJsonObject()));
                         }
                     }
                     parameters.put(key, list);
                 }
             }
         }
-        
+
         return new Task(action, parameters);
     }
 
@@ -143,5 +147,23 @@ public class ResponseParser {
             return tasks;
         }
     }
-}
 
+    private static Map<String, Object> parseMap(JsonObject obj) {
+        Map<String, Object> map = new HashMap<>();
+        for (String key : obj.keySet()) {
+            JsonElement value = obj.get(key);
+            if (value.isJsonPrimitive()) {
+                if (value.getAsJsonPrimitive().isNumber()) {
+                    map.put(key, value.getAsNumber());
+                } else if (value.getAsJsonPrimitive().isBoolean()) {
+                    map.put(key, value.getAsBoolean());
+                } else {
+                    map.put(key, value.getAsString());
+                }
+            } else if (value.isJsonObject()) {
+                map.put(key, parseMap(value.getAsJsonObject()));
+            }
+        }
+        return map;
+    }
+}

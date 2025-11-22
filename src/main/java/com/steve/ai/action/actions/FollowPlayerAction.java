@@ -11,6 +11,8 @@ public class FollowPlayerAction extends BaseAction {
     private String playerName;
     private Player targetPlayer;
     private int ticksRunning;
+    private int ticksStuck = 0;
+    private double lastDistSqr = Double.MAX_VALUE;
     private static final int MAX_TICKS = 6000; // 5 minutes
 
     public FollowPlayerAction(SteveEntity steve, Task task) {
@@ -21,10 +23,16 @@ public class FollowPlayerAction extends BaseAction {
     protected void onStart() {
         playerName = task.getStringParameter("player");
         ticksRunning = 0;
-        
+
+        // Disable flying for safer movement
+        steve.setFlying(false);
+
+        steve.sendChatMessage("Coming to you!");
+
         findPlayer();
-        
+
         if (targetPlayer == null) {
+            steve.setFlying(false);
             result = ActionResult.failure("Player not found: " + playerName);
         }
     }
@@ -32,12 +40,14 @@ public class FollowPlayerAction extends BaseAction {
     @Override
     protected void onTick() {
         ticksRunning++;
-        
+
         if (ticksRunning > MAX_TICKS) {
+            steve.setFlying(false);
+            steve.sendChatMessage("I'm tired of following. I am at " + steve.blockPosition().toShortString());
             result = ActionResult.success("Stopped following");
             return;
         }
-        
+
         if (targetPlayer == null || !targetPlayer.isAlive() || targetPlayer.isRemoved()) {
             findPlayer();
             if (targetPlayer == null) {
@@ -45,18 +55,52 @@ public class FollowPlayerAction extends BaseAction {
                 return;
             }
         }
-        
+
         double distance = steve.distanceTo(targetPlayer);
+
+        // Smart flying: Fly if far, land if close
+        if (distance > 10.0 && !steve.isFlying()) {
+            steve.setFlying(true);
+        } else if (distance < 5.0 && steve.isFlying()) {
+            steve.setFlying(false);
+        }
+
+        steve.getLookControl().setLookAt(targetPlayer, 30.0F, 30.0F);
+
         if (distance > 3.0) {
             steve.getNavigation().moveTo(targetPlayer, 1.0);
         } else if (distance < 2.0) {
+        } else if (distance < 2.0) {
             steve.getNavigation().stop();
+        }
+
+        // Stuck detection
+        double distSqr = steve.distanceToSqr(targetPlayer);
+        if (Math.abs(distSqr - lastDistSqr) < 0.1 && distance > 3.0) {
+            ticksStuck++;
+        } else {
+            ticksStuck = 0;
+            lastDistSqr = distSqr;
+        }
+
+        if (ticksStuck > 200) { // 10 seconds
+            if (distance > 10.0) {
+                com.steve.ai.SteveMod.LOGGER.info("Stuck following (>10s, >10 blocks). Teleporting to player...");
+                teleportToSafePos(targetPlayer.blockPosition());
+                ticksStuck = 0;
+            } else {
+                // Stuck but close. Jump.
+                if (steve.onGround())
+                    steve.getJumpControl().jump();
+                ticksStuck = 180;
+            }
         }
     }
 
     @Override
     protected void onCancel() {
         steve.getNavigation().stop();
+        steve.setFlying(false);
     }
 
     @Override
@@ -66,7 +110,7 @@ public class FollowPlayerAction extends BaseAction {
 
     private void findPlayer() {
         java.util.List<? extends Player> players = steve.level().players();
-        
+
         // First try exact name match
         for (Player player : players) {
             if (player.getName().getString().equalsIgnoreCase(playerName)) {
@@ -74,12 +118,12 @@ public class FollowPlayerAction extends BaseAction {
                 return;
             }
         }
-        
-        if (playerName != null && (playerName.contains("PLAYER") || playerName.contains("NAME") || 
-            playerName.equalsIgnoreCase("me") || playerName.equalsIgnoreCase("you") || playerName.isEmpty())) {
+
+        if (playerName != null && (playerName.contains("PLAYER") || playerName.contains("NAME") ||
+                playerName.equalsIgnoreCase("me") || playerName.equalsIgnoreCase("you") || playerName.isEmpty())) {
             Player nearest = null;
             double nearestDistance = Double.MAX_VALUE;
-            
+
             for (Player player : players) {
                 double distance = steve.distanceTo(player);
                 if (distance < nearestDistance) {
@@ -87,14 +131,13 @@ public class FollowPlayerAction extends BaseAction {
                     nearestDistance = distance;
                 }
             }
-            
+
             if (nearest != null) {
                 targetPlayer = nearest;
                 playerName = nearest.getName().getString(); // Update to actual name
-                com.steve.ai.SteveMod.LOGGER.info("Steve '{}' following nearest player: {}", 
-                    steve.getSteveName(), playerName);
+                com.steve.ai.SteveMod.LOGGER.info("Steve '{}' following nearest player: {}",
+                        steve.getSteveName(), playerName);
             }
         }
     }
 }
-

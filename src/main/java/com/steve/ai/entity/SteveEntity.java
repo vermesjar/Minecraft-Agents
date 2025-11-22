@@ -20,8 +20,8 @@ import net.minecraft.world.level.ServerLevelAccessor;
 import org.jetbrains.annotations.Nullable;
 
 public class SteveEntity extends PathfinderMob {
-    private static final EntityDataAccessor<String> STEVE_NAME = 
-        SynchedEntityData.defineId(SteveEntity.class, EntityDataSerializers.STRING);
+    private static final EntityDataAccessor<String> STEVE_NAME = SynchedEntityData.defineId(SteveEntity.class,
+            EntityDataSerializers.STRING);
 
     private String steveName;
     private SteveMemory memory;
@@ -36,17 +36,21 @@ public class SteveEntity extends PathfinderMob {
         this.memory = new SteveMemory(this);
         this.actionExecutor = new ActionExecutor(this);
         this.setCustomNameVisible(true);
-        
+
         this.isInvulnerable = true;
         this.setInvulnerable(true);
+
+        // Enable water navigation but prefer land
+        this.getNavigation().setCanFloat(true);
+        this.setPathfindingMalus(net.minecraft.world.level.pathfinder.BlockPathTypes.WATER, 8.0F);
     }
 
     public static AttributeSupplier.Builder createAttributes() {
         return Mob.createMobAttributes()
-            .add(Attributes.MAX_HEALTH, 20.0D)
-            .add(Attributes.MOVEMENT_SPEED, 0.25D)
-            .add(Attributes.ATTACK_DAMAGE, 8.0D)
-            .add(Attributes.FOLLOW_RANGE, 48.0D);
+                .add(Attributes.MAX_HEALTH, 20.0D)
+                .add(Attributes.MOVEMENT_SPEED, 0.5D)
+                .add(Attributes.ATTACK_DAMAGE, 8.0D)
+                .add(Attributes.FOLLOW_RANGE, 48.0D);
     }
 
     @Override
@@ -65,7 +69,7 @@ public class SteveEntity extends PathfinderMob {
     @Override
     public void tick() {
         super.tick();
-        
+
         if (!this.level().isClientSide) {
             actionExecutor.tick();
         }
@@ -93,7 +97,7 @@ public class SteveEntity extends PathfinderMob {
     public void addAdditionalSaveData(CompoundTag tag) {
         super.addAdditionalSaveData(tag);
         tag.putString("SteveName", this.steveName);
-        
+
         CompoundTag memoryTag = new CompoundTag();
         this.memory.saveToNBT(memoryTag);
         tag.put("Memory", memoryTag);
@@ -105,7 +109,7 @@ public class SteveEntity extends PathfinderMob {
         if (tag.contains("SteveName")) {
             this.setSteveName(tag.getString("SteveName"));
         }
-        
+
         if (tag.contains("Memory")) {
             this.memory.loadFromNBT(tag.getCompound("Memory"));
         }
@@ -114,21 +118,23 @@ public class SteveEntity extends PathfinderMob {
     @Override
     @Nullable
     public SpawnGroupData finalizeSpawn(ServerLevelAccessor level, DifficultyInstance difficulty,
-                                       MobSpawnType spawnType, @Nullable SpawnGroupData spawnData,
-                                       @Nullable CompoundTag tag) {
+            MobSpawnType spawnType, @Nullable SpawnGroupData spawnData,
+            @Nullable CompoundTag tag) {
         spawnData = super.finalizeSpawn(level, difficulty, spawnType, spawnData, tag);
         return spawnData;
     }
 
     public void sendChatMessage(String message) {
-        if (this.level().isClientSide) return;
-        
+        if (this.level().isClientSide)
+            return;
+
         Component chatComponent = Component.literal("<" + this.steveName + "> " + message);
         this.level().players().forEach(player -> player.sendSystemMessage(chatComponent));
     }
 
     @Override
-    protected void dropCustomDeathLoot(net.minecraft.world.damagesource.DamageSource source, int looting, boolean recentlyHit) {
+    protected void dropCustomDeathLoot(net.minecraft.world.damagesource.DamageSource source, int looting,
+            boolean recentlyHit) {
         super.dropCustomDeathLoot(source, looting, recentlyHit);
     }
 
@@ -143,7 +149,8 @@ public class SteveEntity extends PathfinderMob {
     }
 
     /**
-     * Set invulnerability for building (immune to ALL damage: fire, lava, suffocation, fall, etc.)
+     * Set invulnerability for building (immune to ALL damage: fire, lava,
+     * suffocation, fall, etc.)
      */
     public void setInvulnerableBuilding(boolean invulnerable) {
         this.isInvulnerable = invulnerable;
@@ -164,30 +171,44 @@ public class SteveEntity extends PathfinderMob {
     public void travel(net.minecraft.world.phys.Vec3 travelVector) {
         if (this.isFlying && !this.level().isClientSide) {
             double motionY = this.getDeltaMovement().y;
-            
+
             if (this.getNavigation().isInProgress()) {
                 super.travel(travelVector);
-                
-                // But add ability to move vertically freely
-                if (Math.abs(motionY) < 0.1) {
-                    // Small upward force to prevent falling
-                    this.setDeltaMovement(this.getDeltaMovement().add(0, 0.05, 0));
-                }
             } else {
                 super.travel(travelVector);
             }
         } else {
-            super.travel(travelVector);
+            // Swim logic: If in water and not flying, ensure we can move
+            if (this.isInWater() && !this.isFlying) {
+                this.moveRelative(0.02F, travelVector);
+                this.move(MoverType.SELF, this.getDeltaMovement());
+                this.setDeltaMovement(this.getDeltaMovement().scale(0.8D));
+
+                // Jump if colliding horizontally to climb out
+                if (this.horizontalCollision) {
+                    this.jumpInFluid(net.minecraftforge.common.ForgeMod.WATER_TYPE.get());
+                }
+            } else {
+                super.travel(travelVector);
+            }
         }
     }
 
     @Override
-    public boolean causeFallDamage(float distance, float damageMultiplier, net.minecraft.world.damagesource.DamageSource source) {
+    public boolean causeFallDamage(float distance, float damageMultiplier,
+            net.minecraft.world.damagesource.DamageSource source) {
         // No fall damage when flying
         if (this.isFlying) {
             return false;
         }
         return super.causeFallDamage(distance, damageMultiplier, source);
     }
-}
 
+    public void setAgentGlowing(boolean glowing) {
+        this.setSharedFlag(6, glowing);
+    }
+
+    public boolean isAgentGlowing() {
+        return this.getSharedFlag(6);
+    }
+}

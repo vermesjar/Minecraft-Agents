@@ -5,53 +5,44 @@ import com.steve.ai.action.ActionResult;
 import com.steve.ai.action.Task;
 import com.steve.ai.entity.SteveEntity;
 import net.minecraft.core.BlockPos;
-import net.minecraft.world.InteractionHand;
-import net.minecraft.world.level.block.Block;
-import net.minecraft.world.level.block.Blocks;
+import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.AABB;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 public class MineBlockAction extends BaseAction {
+    private enum MiningState {
+        SEARCHING,
+        MOVING_TO_BLOCK,
+        MINING,
+        RETURNING
+    }
+
+    private MiningState currentState;
     private Block targetBlock;
     private int targetQuantity;
     private int minedCount;
-    private BlockPos currentTarget;
-    private int searchRadius = 8; // Small search radius - stay near player
+    private BlockPos currentTargetBlockPos;
+    private BlockPos returnPos; // Where to return items
     private int ticksRunning;
-    private int ticksSinceLastTorch = 0;
-    private BlockPos miningStartPos; // Fixed mining spot in front of player
-    private BlockPos currentTunnelPos; // Current position in the tunnel
-    private int miningDirectionX = 0; // Direction to mine (-1, 0, or 1)
-    private int miningDirectionZ = 0; // Direction to mine (-1, 0, or 1)
-    private int ticksSinceLastMine = 0; // Delay between mining blocks
-    private static final int MAX_TICKS = 24000; // 20 minutes for deep mining
-    private static final int TORCH_INTERVAL = 100; // Place torch every 5 seconds (100 ticks)
-    private static final int MIN_LIGHT_LEVEL = 8;
-    private static final int MINING_DELAY = 10;
-    private static final int MAX_MINING_RADIUS = 5;
-    
-    // Ore depth mappings for intelligent mining
-    private static final Map<String, Integer> ORE_DEPTHS = new HashMap<>() {{
-        put("iron_ore", 64);  // Iron spawns well at Y=64 and below
-        put("deepslate_iron_ore", -16); // Deep iron
-        put("coal_ore", 96);
-        put("copper_ore", 48);
-        put("gold_ore", 32);
-        put("deepslate_gold_ore", -16);
-        put("diamond_ore", -59);
-        put("deepslate_diamond_ore", -59);
-        put("redstone_ore", 16);
-        put("deepslate_redstone_ore", -32);
-        put("lapis_ore", 0);
-        put("deepslate_lapis_ore", -16);
-        put("emerald_ore", 256); // Mountain biomes
-    }};
+    private int ticksSinceLastPathCalc = 0;
+    private final java.util.Set<BlockPos> veinMineQueue = new java.util.HashSet<>();
+    private static final int MAX_TICKS = 12000; // 10 minutes max
+    private static final int SEARCH_RADIUS = 32;
 
     public MineBlockAction(SteveEntity steve, Task task) {
         super(steve, task);
@@ -60,328 +51,592 @@ public class MineBlockAction extends BaseAction {
     @Override
     protected void onStart() {
         String blockName = task.getStringParameter("block");
-        targetQuantity = task.getIntParameter("quantity", 8); // Mine reasonable amount by default
+        targetQuantity = task.getIntParameter("quantity", 1); // Default to 1
         minedCount = 0;
         ticksRunning = 0;
-        ticksSinceLastTorch = 0;
-        ticksSinceLastMine = 0;
-        
+        currentState = MiningState.SEARCHING;
+
         targetBlock = parseBlock(blockName);
-        
+
         if (targetBlock == null || targetBlock == Blocks.AIR) {
             result = ActionResult.failure("Invalid block type: " + blockName);
             return;
         }
-        
-        net.minecraft.world.entity.player.Player nearestPlayer = findNearestPlayer();
-        if (nearestPlayer != null) {
-            net.minecraft.world.phys.Vec3 eyePos = nearestPlayer.getEyePosition(1.0F);
-            net.minecraft.world.phys.Vec3 lookVec = nearestPlayer.getLookAngle();
-            
-            double angle = Math.atan2(lookVec.z, lookVec.x) * 180.0 / Math.PI;
-            angle = (angle + 360) % 360;
-            
-            if (angle >= 315 || angle < 45) {
-                miningDirectionX = 1; miningDirectionZ = 0; // East (+X)
-            } else if (angle >= 45 && angle < 135) {
-                miningDirectionX = 0; miningDirectionZ = 1; // South (+Z)
-            } else if (angle >= 135 && angle < 225) {
-                miningDirectionX = -1; miningDirectionZ = 0; // West (-X)
-            } else {
-                miningDirectionX = 0; miningDirectionZ = -1; // North (-Z)
-            }
-            
-            net.minecraft.world.phys.Vec3 targetPos = eyePos.add(lookVec.scale(3));
-            
-            BlockPos lookTarget = new BlockPos(
-                (int)Math.floor(targetPos.x),
-                (int)Math.floor(targetPos.y),
-                (int)Math.floor(targetPos.z)
-            );
-            
-            miningStartPos = lookTarget;
-            for (int y = lookTarget.getY(); y > lookTarget.getY() - 20 && y > -64; y--) {
-                BlockPos groundCheck = new BlockPos(lookTarget.getX(), y, lookTarget.getZ());
-                if (steve.level().getBlockState(groundCheck).isSolid()) {
-                    miningStartPos = groundCheck.above(); // Stand on top of solid block
-                    break;
-                }
-            }
-            
-            currentTunnelPos = miningStartPos;
-            steve.teleportTo(miningStartPos.getX() + 0.5, miningStartPos.getY(), miningStartPos.getZ() + 0.5);
-            
-            String[] dirNames = {"North", "East", "South", "West"};
-            int dirIndex = miningDirectionZ == -1 ? 0 : (miningDirectionX == 1 ? 1 : (miningDirectionZ == 1 ? 2 : 3));
-            SteveMod.LOGGER.info("Steve '{}' mining {} in ONE direction: {}", 
-                steve.getSteveName(), targetBlock.getName().getString(), dirNames[dirIndex]);
-        } else {
-            miningStartPos = steve.blockPosition();
-            currentTunnelPos = miningStartPos;
-            miningDirectionX = 1; // Default to East
-            miningDirectionZ = 0;
-        }
-        
-        steve.setFlying(true);
-        
+
+        // Disable flying to prevent clipping and weird movement
+        steve.setFlying(false);
+
         equipIronPickaxe();
-        
-        SteveMod.LOGGER.info("Steve '{}' mining {} - staying at {} [SLOW & VISIBLE]", 
-            steve.getSteveName(), targetBlock.getName().getString(), miningStartPos);
-        
-        // Look for ore nearby
-        findNextBlock();
+        steve.sendChatMessage(
+                "I'm going to mine " + targetQuantity + " " + targetBlock.getName().getString() + " for you.");
+        SteveMod.LOGGER.info("Steve '{}' starting intelligent mining for {} {}. Return pos: {}",
+                steve.getSteveName(), targetQuantity, targetBlock.getName().getString(), returnPos);
     }
 
     @Override
     protected void onTick() {
         ticksRunning++;
-        ticksSinceLastTorch++;
-        ticksSinceLastMine++;
-        
         if (ticksRunning > MAX_TICKS) {
             steve.setFlying(false);
-            steve.setItemInHand(InteractionHand.MAIN_HAND, net.minecraft.world.item.ItemStack.EMPTY);
-            result = ActionResult.failure("Mining timeout - only found " + minedCount + " blocks");
+            steve.sendChatMessage("I couldn't finish mining in time. I got " + minedCount + " blocks. I am at "
+                    + steve.blockPosition().toShortString());
+            result = ActionResult.failure("Mining timeout. Found " + minedCount + " blocks.");
             return;
         }
-        
-        if (ticksSinceLastTorch >= TORCH_INTERVAL) {
-            placeTorchIfDark();
-            ticksSinceLastTorch = 0;
-        }
-        
-        if (ticksSinceLastMine < MINING_DELAY) {
-            return; // Still waiting
-        }
-        
-        if (currentTarget == null) {
-            findNextBlock();
-            
-            if (currentTarget == null) {
-                if (minedCount >= targetQuantity) {
-                    // Found enough ore, mission accomplished
-                    steve.setFlying(false);
-                    steve.setItemInHand(InteractionHand.MAIN_HAND, net.minecraft.world.item.ItemStack.EMPTY);
-                    result = ActionResult.success("Mined " + minedCount + " " + targetBlock.getName().getString());
-                    return;
-                } else {
-                    mineNearbyBlock();
-                    return;
-                }
-            }
-        }
-        
-        if (steve.level().getBlockState(currentTarget).getBlock() == targetBlock) {
-            steve.teleportTo(currentTarget.getX() + 0.5, currentTarget.getY(), currentTarget.getZ() + 0.5);
-            
-            steve.swing(InteractionHand.MAIN_HAND, true);
-            
-            steve.level().destroyBlock(currentTarget, true);
-            minedCount++;
-            ticksSinceLastMine = 0; // Reset delay timer
-            
-            SteveMod.LOGGER.info("Steve '{}' moved to ore and mined {} at {} - Total: {}/{}", 
-                steve.getSteveName(), targetBlock.getName().getString(), currentTarget, 
-                minedCount, targetQuantity);
-            
-            if (minedCount >= targetQuantity) {
-                steve.setFlying(false);
-                steve.setItemInHand(InteractionHand.MAIN_HAND, net.minecraft.world.item.ItemStack.EMPTY);
-                result = ActionResult.success("Mined " + minedCount + " " + targetBlock.getName().getString());
-                return;
-            }
-            
-            currentTarget = null;
-        } else {
-            currentTarget = null;
+
+        switch (currentState) {
+            case SEARCHING:
+                handleSearching();
+                break;
+            case MOVING_TO_BLOCK:
+                handleMovingToBlock();
+                break;
+            case MINING:
+                handleMining();
+                break;
+            case RETURNING:
+                handleReturning();
+                break;
         }
     }
 
-    @Override
-    protected void onCancel() {
-        steve.setFlying(false);
+    private void handleSearching() {
         steve.getNavigation().stop();
-        steve.setItemInHand(InteractionHand.MAIN_HAND, net.minecraft.world.item.ItemStack.EMPTY);
-    }
 
-    @Override
-    public String getDescription() {
-        return "Mine " + targetQuantity + " " + targetBlock.getName().getString() + " (" + minedCount + " found)";
-    }
+        // Scan nearby blocks
+        BlockPos foundPos = null;
 
-    /**
-     * Check light level and place torch if too dark
-     */
-    private void placeTorchIfDark() {
-        BlockPos stevePos = steve.blockPosition();
-        int lightLevel = steve.level().getBrightness(net.minecraft.world.level.LightLayer.BLOCK, stevePos);
-        
-        if (lightLevel < MIN_LIGHT_LEVEL) {
-            BlockPos torchPos = findTorchPosition(stevePos);
-            
-            if (torchPos != null && steve.level().getBlockState(torchPos).isAir()) {
-                steve.level().setBlock(torchPos, Blocks.TORCH.defaultBlockState(), 3);
-                SteveMod.LOGGER.info("Steve '{}' placed torch at {} (light level was {})", 
-                    steve.getSteveName(), torchPos, lightLevel);
-                
-                steve.swing(InteractionHand.MAIN_HAND, true);
+        // Priority: Vein mine queue
+        if (!veinMineQueue.isEmpty()) {
+            foundPos = veinMineQueue.iterator().next();
+            veinMineQueue.remove(foundPos);
+            // Verify it's still there
+            if (!isSameOre(steve.level().getBlockState(foundPos).getBlock(), targetBlock)) {
+                foundPos = null; // Block gone, search again
             }
         }
-    }
-    
-    /**
-     * Find a good position to place a torch (on floor or wall)
-     */
-    private BlockPos findTorchPosition(BlockPos center) {
-        BlockPos floorPos = center.below();
-        if (steve.level().getBlockState(floorPos).isSolid() && 
-            steve.level().getBlockState(center).isAir()) {
-            return center;
+
+        if (foundPos == null) {
+            foundPos = scanForTargetBlock();
         }
-        
-        BlockPos[] wallPositions = {
-            center.north(), center.south(), center.east(), center.west()
-        };
-        
-        for (BlockPos wallPos : wallPositions) {
-            if (steve.level().getBlockState(wallPos).isSolid() && 
-                steve.level().getBlockState(center).isAir()) {
-                return center;
+
+        if (foundPos != null) {
+            currentTargetBlockPos = foundPos;
+            currentState = MiningState.MOVING_TO_BLOCK;
+            if (minedCount == 0) {
+                steve.sendChatMessage(
+                        "Found " + targetBlock.getName().getString() + " at " + foundPos.toShortString() + "!");
             }
-        }
-        
-        return null;
-    }
-
-    /**
-     * Mine forward in ONE DIRECTION - creates a straight tunnel!
-     * Steve progresses forward block by block
-     */
-    private void mineNearbyBlock() {
-        BlockPos centerPos = currentTunnelPos;
-        BlockPos abovePos = centerPos.above();
-        BlockPos belowPos = centerPos.below();
-        
-        BlockState centerState = steve.level().getBlockState(centerPos);
-        if (!centerState.isAir() && centerState.getBlock() != Blocks.BEDROCK) {
-            steve.teleportTo(centerPos.getX() + 0.5, centerPos.getY(), centerPos.getZ() + 0.5);
-            steve.swing(InteractionHand.MAIN_HAND, true);
-            steve.level().destroyBlock(centerPos, true);
-            SteveMod.LOGGER.info("Steve '{}' mining tunnel at {}", steve.getSteveName(), centerPos);
-        }
-        
-        BlockState aboveState = steve.level().getBlockState(abovePos);
-        if (!aboveState.isAir() && aboveState.getBlock() != Blocks.BEDROCK) {
-            steve.swing(InteractionHand.MAIN_HAND, true);
-            steve.level().destroyBlock(abovePos, true);
-        }
-        
-        BlockState belowState = steve.level().getBlockState(belowPos);
-        if (!belowState.isAir() && belowState.getBlock() != Blocks.BEDROCK) {
-            steve.swing(InteractionHand.MAIN_HAND, true);
-            steve.level().destroyBlock(belowPos, true);
-        }
-        
-        currentTunnelPos = currentTunnelPos.offset(miningDirectionX, 0, miningDirectionZ);
-        
-        ticksSinceLastMine = 0; // Reset delay
-    }
-
-    /**
-     * Find ore blocks in the tunnel ahead
-     * Searches forward in the mining direction
-     */
-    private void findNextBlock() {
-        List<BlockPos> foundBlocks = new ArrayList<>();
-        
-        for (int distance = 0; distance < 20; distance++) {
-            BlockPos checkPos = currentTunnelPos.offset(miningDirectionX * distance, 0, miningDirectionZ * distance);
-            
-            for (int y = -1; y <= 1; y++) {
-                BlockPos orePos = checkPos.offset(0, y, 0);
-                if (steve.level().getBlockState(orePos).getBlock() == targetBlock) {
-                    foundBlocks.add(orePos);
+            SteveMod.LOGGER.info("Found {} at {}", targetBlock.getName().getString(), foundPos);
+        } else {
+            // For deep ores (diamonds, etc.), dig downwards using staircase
+            if (isDeepOre(targetBlock) && steve.getY() > 16) {
+                digStaircase();
+            } else {
+                // Wander randomly if not found nearby
+                if (steve.getNavigation().isDone()) {
+                    // Increased wander radius to 16 to cover more ground
+                    Vec3 randomPos = DefaultRandomPos.getPos(steve, 16, 7);
+                    if (randomPos != null) {
+                        steve.getNavigation().moveTo(randomPos.x, randomPos.y, randomPos.z, 1.0);
+                    }
                 }
             }
         }
-        
-        if (!foundBlocks.isEmpty()) {
-            currentTarget = foundBlocks.stream()
-                .min((a, b) -> Double.compare(a.distSqr(currentTunnelPos), b.distSqr(currentTunnelPos)))
-                .orElse(null);
-            
-            if (currentTarget != null) {
-                SteveMod.LOGGER.info("Steve '{}' found {} ahead in tunnel at {}", 
-                    steve.getSteveName(), targetBlock.getName().getString(), currentTarget);
+    }
+
+    private void digStaircase() {
+        // Dig a 3x3 staircase down in the direction we are facing
+        Direction dir = steve.getDirection();
+        BlockPos pos = steve.blockPosition();
+
+        // Pattern: Forward 1, Down 1. Clear 3 high, 2 wide for easy passage.
+        BlockPos nextStep = pos.relative(dir).below();
+
+        // Check if we can dig here (don't dig bedrock or unbreakable)
+        if (steve.level().getBlockState(nextStep).getDestroySpeed(steve.level(), nextStep) < 0) {
+            // Hit bedrock or something hard, turn around
+            steve.setYRot(steve.getYRot() + 180);
+            return;
+        }
+
+        // Clear area for staircase
+        List<BlockPos> toClear = new ArrayList<>();
+        toClear.add(nextStep); // The step
+        toClear.add(nextStep.above()); // Head space
+        toClear.add(nextStep.above(2)); // Extra head space
+
+        // Widen the path
+        Direction right = dir.getClockWise();
+        toClear.add(nextStep.relative(right));
+        toClear.add(nextStep.relative(right).above());
+        toClear.add(nextStep.relative(right).above(2));
+
+        boolean dug = false;
+        for (BlockPos p : toClear) {
+            if (!steve.level().isEmptyBlock(p)) {
+                steve.level().destroyBlock(p, true);
+                dug = true;
+            }
+        }
+
+        if (dug) {
+            steve.getNavigation().moveTo(nextStep.getX() + 0.5, nextStep.getY(), nextStep.getZ() + 0.5, 1.0);
+            SteveMod.LOGGER.info("Digging staircase down to Y={}", nextStep.getY());
+        } else {
+            // If nothing to dig, just move
+            steve.getNavigation().moveTo(nextStep.getX() + 0.5, nextStep.getY(), nextStep.getZ() + 0.5, 1.0);
+        }
+    }
+
+    private int ticksStuck = 0;
+    private double lastDistSqr = Double.MAX_VALUE;
+
+    private void handleMovingToBlock() {
+        if (currentTargetBlockPos == null) {
+            currentState = MiningState.SEARCHING;
+            return;
+        }
+
+        double distSqr = steve.blockPosition().distSqr(currentTargetBlockPos);
+
+        // Check if we are stuck
+        if (Math.abs(distSqr - lastDistSqr) < 0.1) {
+            ticksStuck++;
+        } else {
+            ticksStuck = 0;
+            lastDistSqr = distSqr;
+        }
+
+        // Teleport failsafe if stuck
+        // User request: "teleport after some amount of time, maybe 10 seconds if they
+        // arent within 10 blocks"
+        if (ticksStuck > 200) { // 10 seconds
+            if (distSqr > 100.0) { // > 10 blocks away
+                SteveMod.LOGGER.info("Stuck moving to block (>10s, >10 blocks). Teleporting...");
+                teleportToSafePos(currentTargetBlockPos);
+                steve.getNavigation().stop();
+                currentState = MiningState.MINING;
+                ticksStuck = 0;
+                return;
+            } else {
+                // Stuck but close (< 10 blocks).
+                // Try to clear surroundings if we are in a hole/tunnel
+                if (ticksStuck % 20 == 0) { // Every second
+                    clearSurroundings();
+                    if (steve.onGround())
+                        steve.getJumpControl().jump();
+                }
+
+                // If we are digging deep and stuck, try to continue the staircase
+                if (isDeepOre(targetBlock) && ticksStuck > 100) {
+                    digStaircase();
+                }
+
+                // Reset stuck counter slightly to avoid spamming but keep checking
+                ticksStuck = 180;
+            }
+        }
+
+        if (distSqr <= 25.0) { // Increased range to 5 blocks (5^2 = 25)
+            steve.getNavigation().stop();
+            currentState = MiningState.MINING;
+        } else {
+            if (ticksSinceLastPathCalc++ > 10 || steve.getNavigation().isDone()) { // Check more frequently (0.5s)
+                boolean pathFound = steve.getNavigation().moveTo(currentTargetBlockPos.getX(),
+                        currentTargetBlockPos.getY(), currentTargetBlockPos.getZ(), 1.0);
+
+                if (!pathFound && distSqr < 100.0) {
+                    // If pathfinding fails and we are close, try to move directly or teleport
+                    ticksStuck += 10; // Accelerate stuck detection
+                } else if (!pathFound && distSqr > 100.0 && isDeepOre(targetBlock)
+                        && currentTargetBlockPos.getY() < steve.getY()) {
+                    // If pathfinding fails for deep ore, dig staircase
+                    digStaircase();
+                } else if (steve.isInWater() && !steve.isFlying()) {
+                    // If stuck in water, try to jump/swim up
+                    steve.getJumpControl().jump();
+                }
+
+                ticksSinceLastPathCalc = 0;
             }
         }
     }
 
-    /**
-     * Equip an iron pickaxe for mining
-     */
-    private void equipIronPickaxe() {
-        // Give Steve an iron pickaxe if he doesn't have one
-        net.minecraft.world.item.ItemStack pickaxe = new net.minecraft.world.item.ItemStack(
-            net.minecraft.world.item.Items.IRON_PICKAXE
-        );
-        steve.setItemInHand(net.minecraft.world.InteractionHand.MAIN_HAND, pickaxe);
-        SteveMod.LOGGER.info("Steve '{}' equipped iron pickaxe for mining", steve.getSteveName());
+    private void handleMining() {
+        if (currentTargetBlockPos == null) {
+            currentState = MiningState.SEARCHING;
+            return;
+        }
+
+        BlockState state = steve.level().getBlockState(currentTargetBlockPos);
+        if (!isSameOre(state.getBlock(), targetBlock)) {
+            // Block is gone or changed
+            currentState = MiningState.SEARCHING;
+            return;
+        }
+
+        // Mine the block
+        steve.swing(InteractionHand.MAIN_HAND, true);
+        // Destroy block without dropping items (we simulate collection)
+        steve.level().destroyBlock(currentTargetBlockPos, false);
+
+        // Collect drops nearby
+        collectDrops(currentTargetBlockPos);
+
+        minedCount++;
+
+        // Vein mining logic: If it's a log, scan for connected logs
+        if (targetBlock.getName().getString().toLowerCase().contains("log")) {
+            scanForVein(currentTargetBlockPos);
+        }
+
+        SteveMod.LOGGER.info("Mined {} ({}/{})", targetBlock.getName().getString(), minedCount, targetQuantity);
+
+        if (minedCount >= targetQuantity) {
+            currentState = MiningState.RETURNING;
+            steve.sendChatMessage(
+                    "I've collected enough " + targetBlock.getName().getString() + ". Coming back to you now.");
+            SteveMod.LOGGER.info("Target quantity reached. Returning to {}", returnPos);
+        } else {
+            currentState = MiningState.SEARCHING;
+        }
     }
 
-    /**
-     * Find the nearest player to determine mining direction
-     */
-    private net.minecraft.world.entity.player.Player findNearestPlayer() {
-        java.util.List<? extends net.minecraft.world.entity.player.Player> players = steve.level().players();
-        
-        if (players.isEmpty()) {
-            return null;
-        }
-        
-        net.minecraft.world.entity.player.Player nearest = null;
-        double nearestDistance = Double.MAX_VALUE;
-        
-        for (net.minecraft.world.entity.player.Player player : players) {
-            if (!player.isAlive() || player.isRemoved() || player.isSpectator()) {
+    private void collectDrops(BlockPos pos) {
+        // Scan for ItemEntities nearby and "collect" them
+        AABB searchBox = new AABB(pos).inflate(4.0);
+        List<ItemEntity> items = steve.level().getEntitiesOfClass(ItemEntity.class, searchBox);
+
+        for (ItemEntity item : items) {
+            if (!item.isAlive())
                 continue;
-            }
-            
-            double distance = steve.distanceTo(player);
-            if (distance < nearestDistance) {
-                nearestDistance = distance;
-                nearest = player;
+            // Simulate pickup
+            item.discard(); // Remove from world
+        }
+    }
+
+    private void handleReturning() {
+        // Always update return position to nearest player to avoid going to old
+        // location
+        Player player = steve.level().getNearestPlayer(steve, 100);
+        if (player != null) {
+            returnPos = player.blockPosition();
+        } else if (returnPos == null) {
+            returnPos = steve.blockPosition(); // Fallback
+        }
+
+        double distSqr = steve.blockPosition().distSqr(returnPos);
+
+        // Check if we are stuck
+        if (Math.abs(distSqr - lastDistSqr) < 0.1) {
+            ticksStuck++;
+        } else {
+            ticksStuck = 0;
+            lastDistSqr = distSqr;
+        }
+
+        // Teleport failsafe if stuck
+        // User request: "teleport after some amount of time, maybe 10 seconds if they
+        // arent within 10 blocks"
+        if (ticksStuck > 200) { // 10 seconds
+            if (distSqr > 100.0) { // > 10 blocks away
+                SteveMod.LOGGER.info("Stuck returning (>10s, >10 blocks). Teleporting...");
+                teleportToSafePos(returnPos);
+                steve.getNavigation().stop();
+                steve.setFlying(false);
+                deliverItems(player);
+                return;
+            } else {
+                // Stuck but close (< 10 blocks). Do NOT teleport.
+                if (steve.onGround())
+                    steve.getJumpControl().jump();
+                ticksStuck = 180;
             }
         }
-        
-        return nearest;
+
+        if (distSqr <= 9.0) { // Within 3 blocks
+            steve.getNavigation().stop();
+            steve.setFlying(false);
+            deliverItems(player);
+        } else {
+            if (ticksSinceLastPathCalc++ > 10 || steve.getNavigation().isDone()) {
+                boolean pathFound = steve.getNavigation().moveTo(returnPos.getX(), returnPos.getY(), returnPos.getZ(),
+                        1.0);
+
+                if (!pathFound && distSqr < 100.0) {
+                    ticksStuck += 10;
+                }
+
+                ticksSinceLastPathCalc = 0;
+            }
+        }
+    }
+
+    private void deliverItems(Player player) {
+        ItemStack stack = new ItemStack(getDropForItem(targetBlock), minedCount);
+        boolean added = false;
+
+        if (player != null) {
+            added = player.getInventory().add(stack);
+            if (added) {
+                steve.sendChatMessage(
+                        "I put " + minedCount + " " + targetBlock.getName().getString() + " in your inventory.");
+            } else {
+                steve.sendChatMessage(
+                        "Your inventory is full, so I dropped the " + targetBlock.getName().getString() + " here.");
+            }
+        }
+
+        if (!added) {
+            ItemEntity itemEntity = new ItemEntity(steve.level(), steve.getX(), steve.getY(), steve.getZ(), stack);
+            steve.level().addFreshEntity(itemEntity);
+        }
+
+        steve.setItemInHand(InteractionHand.MAIN_HAND, ItemStack.EMPTY);
+        result = ActionResult
+                .success("Mined " + minedCount + " " + targetBlock.getName().getString() + " and returned.");
+    }
+
+    private BlockPos scanForTargetBlock() {
+        BlockPos stevePos = steve.blockPosition();
+        List<BlockPos> found = new ArrayList<>();
+
+        for (int x = -SEARCH_RADIUS; x <= SEARCH_RADIUS; x++) {
+            for (int y = -SEARCH_RADIUS; y <= SEARCH_RADIUS; y++) {
+                for (int z = -SEARCH_RADIUS; z <= SEARCH_RADIUS; z++) {
+                    BlockPos pos = stevePos.offset(x, y, z);
+                    if (isSameOre(steve.level().getBlockState(pos).getBlock(), targetBlock)) {
+                        found.add(pos);
+                    }
+                }
+            }
+        }
+
+        if (found.isEmpty())
+            return null;
+
+        // Return nearest, preferring non-water blocks
+        return found.stream()
+                .min(Comparator.comparingDouble(p -> {
+                    double dist = p.distSqr(stevePos);
+                    // Add penalty for underwater blocks
+                    if (steve.level().getFluidState(p).isSource()) {
+                        dist += 1000.0;
+                    }
+                    return dist;
+                }))
+                .orElse(null);
+    }
+
+    private void equipIronPickaxe() {
+        steve.setItemInHand(InteractionHand.MAIN_HAND, new ItemStack(net.minecraft.world.item.Items.IRON_PICKAXE));
+    }
+
+    private boolean isDeepOre(Block block) {
+        // Ores that spawn deep underground (Y < 20)
+        return isSameOre(block, Blocks.DIAMOND_ORE) ||
+                isSameOre(block, Blocks.REDSTONE_ORE) ||
+                isSameOre(block, Blocks.LAPIS_ORE) ||
+                isSameOre(block, Blocks.GOLD_ORE) ||
+                isSameOre(block, Blocks.IRON_ORE) ||
+                isSameOre(block, Blocks.COPPER_ORE);
+    }
+
+    private void scanForVein(BlockPos center) {
+        for (int x = -1; x <= 1; x++) {
+            for (int y = 0; y <= 1; y++) { // Look up and adjacent
+                for (int z = -1; z <= 1; z++) {
+                    if (x == 0 && y == 0 && z == 0)
+                        continue;
+                    BlockPos pos = center.offset(x, y, z);
+                    if (isSameOre(steve.level().getBlockState(pos).getBlock(), targetBlock)) {
+                        // Only add to queue if we still need more blocks
+                        if (minedCount + veinMineQueue.size() < targetQuantity) {
+                            veinMineQueue.add(pos);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private boolean isSameOre(Block a, Block b) {
+        if (a == b)
+            return true;
+
+        // Check for deepslate variants
+        if (a == Blocks.DIAMOND_ORE && b == Blocks.DEEPSLATE_DIAMOND_ORE)
+            return true;
+        if (a == Blocks.DEEPSLATE_DIAMOND_ORE && b == Blocks.DIAMOND_ORE)
+            return true;
+
+        if (a == Blocks.IRON_ORE && b == Blocks.DEEPSLATE_IRON_ORE)
+            return true;
+        if (a == Blocks.DEEPSLATE_IRON_ORE && b == Blocks.IRON_ORE)
+            return true;
+
+        if (a == Blocks.GOLD_ORE && b == Blocks.DEEPSLATE_GOLD_ORE)
+            return true;
+        if (a == Blocks.DEEPSLATE_GOLD_ORE && b == Blocks.GOLD_ORE)
+            return true;
+
+        if (a == Blocks.COPPER_ORE && b == Blocks.DEEPSLATE_COPPER_ORE)
+            return true;
+        if (a == Blocks.DEEPSLATE_COPPER_ORE && b == Blocks.COPPER_ORE)
+            return true;
+
+        if (a == Blocks.COAL_ORE && b == Blocks.DEEPSLATE_COAL_ORE)
+            return true;
+        if (a == Blocks.DEEPSLATE_COAL_ORE && b == Blocks.COAL_ORE)
+            return true;
+
+        if (a == Blocks.EMERALD_ORE && b == Blocks.DEEPSLATE_EMERALD_ORE)
+            return true;
+        if (a == Blocks.DEEPSLATE_EMERALD_ORE && b == Blocks.EMERALD_ORE)
+            return true;
+
+        if (a == Blocks.LAPIS_ORE && b == Blocks.DEEPSLATE_LAPIS_ORE)
+            return true;
+        if (a == Blocks.DEEPSLATE_LAPIS_ORE && b == Blocks.LAPIS_ORE)
+            return true;
+
+        if (a == Blocks.REDSTONE_ORE && b == Blocks.DEEPSLATE_REDSTONE_ORE)
+            return true;
+        if (a == Blocks.DEEPSLATE_REDSTONE_ORE && b == Blocks.REDSTONE_ORE)
+            return true;
+
+        return false;
+    }
+
+    private net.minecraft.world.item.Item getDropForItem(Block block) {
+        if (block == Blocks.DIAMOND_ORE || block == Blocks.DEEPSLATE_DIAMOND_ORE)
+            return net.minecraft.world.item.Items.DIAMOND;
+        if (block == Blocks.IRON_ORE || block == Blocks.DEEPSLATE_IRON_ORE)
+            return net.minecraft.world.item.Items.RAW_IRON;
+        if (block == Blocks.GOLD_ORE || block == Blocks.DEEPSLATE_GOLD_ORE)
+            return net.minecraft.world.item.Items.RAW_GOLD;
+        if (block == Blocks.COPPER_ORE || block == Blocks.DEEPSLATE_COPPER_ORE)
+            return net.minecraft.world.item.Items.RAW_COPPER;
+        if (block == Blocks.COAL_ORE || block == Blocks.DEEPSLATE_COAL_ORE)
+            return net.minecraft.world.item.Items.COAL;
+        if (block == Blocks.EMERALD_ORE || block == Blocks.DEEPSLATE_EMERALD_ORE)
+            return net.minecraft.world.item.Items.EMERALD;
+        if (block == Blocks.LAPIS_ORE || block == Blocks.DEEPSLATE_LAPIS_ORE)
+            return net.minecraft.world.item.Items.LAPIS_LAZULI;
+        if (block == Blocks.REDSTONE_ORE || block == Blocks.DEEPSLATE_REDSTONE_ORE)
+            return net.minecraft.world.item.Items.REDSTONE;
+
+        return block.asItem();
     }
 
     private Block parseBlock(String blockName) {
         blockName = blockName.toLowerCase().replace(" ", "_");
-        
-        Map<String, String> resourceToOre = new HashMap<>() {{
-            put("iron", "iron_ore");
-            put("diamond", "diamond_ore");
-            put("coal", "coal_ore");
-            put("gold", "gold_ore");
-            put("copper", "copper_ore");
-            put("redstone", "redstone_ore");
-            put("lapis", "lapis_ore");
-            put("emerald", "emerald_ore");
-        }};
-        
+
+        // Handle "minecraft:" prefix if present
+        if (blockName.startsWith("minecraft:")) {
+            blockName = blockName.substring(10);
+        }
+
+        Map<String, String> resourceToOre = new HashMap<>() {
+            {
+                // Ores
+                put("iron", "iron_ore");
+                put("diamond", "diamond_ore");
+                put("coal", "coal_ore");
+                put("gold", "gold_ore");
+                put("copper", "copper_ore");
+                put("redstone", "redstone_ore");
+                put("lapis", "lapis_ore");
+                put("emerald", "emerald_ore");
+
+                // Trees/Logs - Map generic terms to Oak (most common)
+                put("log", "oak_log");
+                put("wood", "oak_log");
+                put("tree", "oak_log");
+                put("plank", "oak_planks");
+                put("planks", "oak_planks");
+
+                // Common blocks
+                put("stone", "stone");
+                put("cobblestone", "cobblestone");
+                put("dirt", "dirt");
+                put("grass", "grass_block");
+                put("sand", "sand");
+                put("gravel", "gravel");
+            }
+        };
+
         if (resourceToOre.containsKey(blockName)) {
             blockName = resourceToOre.get(blockName);
         }
-        
-        if (!blockName.contains(":")) {
-            blockName = "minecraft:" + blockName;
+
+        // Try to find the block
+        ResourceLocation location = new ResourceLocation("minecraft", blockName);
+        Block block = BuiltInRegistries.BLOCK.get(location);
+
+        // If strictly AIR (default), it might be invalid unless they actually asked for
+        // air
+        if (block == Blocks.AIR && !blockName.equals("air")) {
+            // Try adding _log if it ends with wood
+            if (blockName.endsWith("wood")) {
+                location = new ResourceLocation("minecraft", blockName.replace("wood", "log"));
+                block = BuiltInRegistries.BLOCK.get(location);
+            }
         }
-        
-        ResourceLocation resourceLocation = new ResourceLocation(blockName);
-        return BuiltInRegistries.BLOCK.get(resourceLocation);
+
+        return block;
+    }
+
+    @Override
+    protected void onCancel() {
+        steve.getNavigation().stop();
+        steve.setFlying(false);
+        steve.setItemInHand(InteractionHand.MAIN_HAND, ItemStack.EMPTY);
+    }
+
+    @Override
+    public String getDescription() {
+        return "Mining " + targetBlock.getName().getString() + " (" + currentState + ")";
+    }
+
+    private void clearSurroundings() {
+        // Clear 3x3 area around head and feet to ensure we aren't trapped
+        BlockPos head = steve.blockPosition().above();
+        BlockPos feet = steve.blockPosition();
+
+        List<BlockPos> toCheck = new ArrayList<>();
+        // Check feet level
+        for (int x = -1; x <= 1; x++) {
+            for (int z = -1; z <= 1; z++) {
+                toCheck.add(feet.offset(x, 0, z));
+            }
+        }
+        // Check head level
+        for (int x = -1; x <= 1; x++) {
+            for (int z = -1; z <= 1; z++) {
+                toCheck.add(head.offset(x, 0, z));
+            }
+        }
+
+        for (BlockPos pos : toCheck) {
+            if (pos.equals(feet))
+                continue; // Don't dig the block we are standing on!
+
+            BlockState state = steve.level().getBlockState(pos);
+            if (!state.isAir() && state.getDestroySpeed(steve.level(), pos) >= 0) {
+                // Don't mine the target block by accident here, we want to move to it
+                if (state.getBlock() != targetBlock) {
+                    steve.level().destroyBlock(pos, true); // Break it
+                }
+            }
+        }
+    }
+
+    // Helper for random movement
+    private static class DefaultRandomPos {
+        static Vec3 getPos(SteveEntity entity, int radius, int verticalRange) {
+            return net.minecraft.world.entity.ai.util.DefaultRandomPos.getPos(entity, radius, verticalRange);
+        }
     }
 }
-

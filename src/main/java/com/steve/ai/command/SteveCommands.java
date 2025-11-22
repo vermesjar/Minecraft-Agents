@@ -13,31 +13,33 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.phys.Vec3;
 
 public class SteveCommands {
-    
+
     public static void register(CommandDispatcher<CommandSourceStack> dispatcher) {
         dispatcher.register(Commands.literal("steve")
-            .then(Commands.literal("spawn")
-                .then(Commands.argument("name", StringArgumentType.string())
-                    .executes(SteveCommands::spawnSteve)))
-            .then(Commands.literal("remove")
-                .then(Commands.argument("name", StringArgumentType.string())
-                    .executes(SteveCommands::removeSteve)))
-            .then(Commands.literal("list")
-                .executes(SteveCommands::listSteves))
-            .then(Commands.literal("stop")
-                .then(Commands.argument("name", StringArgumentType.string())
-                    .executes(SteveCommands::stopSteve)))
-            .then(Commands.literal("tell")
-                .then(Commands.argument("name", StringArgumentType.string())
-                    .then(Commands.argument("command", StringArgumentType.greedyString())
-                        .executes(SteveCommands::tellSteve))))
-        );
+                .then(Commands.literal("spawn")
+                        .then(Commands.argument("name", StringArgumentType.string())
+                                .executes(SteveCommands::spawnSteve)))
+                .then(Commands.literal("remove")
+                        .then(Commands.argument("name", StringArgumentType.string())
+                                .executes(SteveCommands::removeSteve)))
+                .then(Commands.literal("list")
+                        .executes(SteveCommands::listSteves))
+                .then(Commands.literal("stop")
+                        .then(Commands.argument("name", StringArgumentType.string())
+                                .executes(SteveCommands::stopSteve)))
+                .then(Commands.literal("tell")
+                        .then(Commands.argument("name", StringArgumentType.string())
+                                .then(Commands.argument("command", StringArgumentType.greedyString())
+                                        .executes(SteveCommands::tellSteve))))
+                .then(Commands.literal("glow")
+                        .then(Commands.argument("name", StringArgumentType.string())
+                                .executes(SteveCommands::toggleGlow))));
     }
 
     private static int spawnSteve(CommandContext<CommandSourceStack> context) {
         String name = StringArgumentType.getString(context, "name");
         CommandSourceStack source = context.getSource();
-        
+
         ServerLevel serverLevel = source.getLevel();
         if (serverLevel == null) {
             source.sendFailure(Component.literal("Command must be run on server"));
@@ -45,7 +47,7 @@ public class SteveCommands {
         }
 
         SteveManager manager = SteveMod.getSteveManager();
-        
+
         Vec3 sourcePos = source.getPosition();
         if (source.getEntity() != null) {
             Vec3 lookVec = source.getEntity().getLookAngle();
@@ -54,13 +56,14 @@ public class SteveCommands {
             sourcePos = sourcePos.add(3, 0, 0);
         }
         Vec3 spawnPos = sourcePos;
-        
+
         SteveEntity steve = manager.spawnSteve(serverLevel, spawnPos, name);
         if (steve != null) {
             source.sendSuccess(() -> Component.literal("Spawned Steve: " + name), true);
             return 1;
         } else {
-            source.sendFailure(Component.literal("Failed to spawn Steve. Name may already exist or max limit reached."));
+            source.sendFailure(
+                    Component.literal("Failed to spawn Steve. Name may already exist or max limit reached."));
             return 0;
         }
     }
@@ -68,7 +71,7 @@ public class SteveCommands {
     private static int removeSteve(CommandContext<CommandSourceStack> context) {
         String name = StringArgumentType.getString(context, "name");
         CommandSourceStack source = context.getSource();
-        
+
         SteveManager manager = SteveMod.getSteveManager();
         if (manager.removeSteve(name)) {
             source.sendSuccess(() -> Component.literal("Removed Steve: " + name), true);
@@ -82,12 +85,14 @@ public class SteveCommands {
     private static int listSteves(CommandContext<CommandSourceStack> context) {
         CommandSourceStack source = context.getSource();
         SteveManager manager = SteveMod.getSteveManager();
-        
+
         var names = manager.getSteveNames();
         if (names.isEmpty()) {
             source.sendSuccess(() -> Component.literal("No active Steves"), false);
         } else {
-            source.sendSuccess(() -> Component.literal("Active Steves (" + names.size() + "): " + String.join(", ", names)), false);
+            source.sendSuccess(
+                    () -> Component.literal("Active Steves (" + names.size() + "): " + String.join(", ", names)),
+                    false);
         }
         return 1;
     }
@@ -95,10 +100,10 @@ public class SteveCommands {
     private static int stopSteve(CommandContext<CommandSourceStack> context) {
         String name = StringArgumentType.getString(context, "name");
         CommandSourceStack source = context.getSource();
-        
+
         SteveManager manager = SteveMod.getSteveManager();
         SteveEntity steve = manager.getSteve(name);
-        
+
         if (steve != null) {
             steve.getActionExecutor().stopCurrentAction();
             steve.getMemory().clearTaskQueue();
@@ -114,18 +119,38 @@ public class SteveCommands {
         String name = StringArgumentType.getString(context, "name");
         String command = StringArgumentType.getString(context, "command");
         CommandSourceStack source = context.getSource();
-        
+
         SteveManager manager = SteveMod.getSteveManager();
         SteveEntity steve = manager.getSteve(name);
-        
+
         if (steve != null) {
             // Disabled command feedback message
-            // source.sendSuccess(() -> Component.literal("Instructing " + name + ": " + command), true);
-            
+            // source.sendSuccess(() -> Component.literal("Instructing " + name + ": " +
+            // command), true);
+
             new Thread(() -> {
                 steve.getActionExecutor().processNaturalLanguageCommand(command);
             }).start();
-            
+
+            return 1;
+        } else {
+            source.sendFailure(Component.literal("Steve not found: " + name));
+            return 0;
+        }
+    }
+
+    private static int toggleGlow(CommandContext<CommandSourceStack> context) {
+        String name = StringArgumentType.getString(context, "name");
+        CommandSourceStack source = context.getSource();
+
+        SteveManager manager = SteveMod.getSteveManager();
+        SteveEntity steve = manager.getSteve(name);
+
+        if (steve != null) {
+            boolean isGlowing = steve.isAgentGlowing();
+            steve.setAgentGlowing(!isGlowing);
+            source.sendSuccess(() -> Component.literal((!isGlowing ? "Enabled" : "Disabled") + " glowing for " + name),
+                    true);
             return 1;
         } else {
             source.sendFailure(Component.literal("Steve not found: " + name));
@@ -133,4 +158,3 @@ public class SteveCommands {
         }
     }
 }
-
